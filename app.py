@@ -2,14 +2,23 @@ import os
 import sys
 from pathlib import Path
 
+from typing import Optional
+
 from PySide6.QtCore import Qt, QUrl, QSize
-from PySide6.QtGui import QPixmap, QIcon, QFont
+from PySide6.QtGui import QPixmap, QIcon, QFont, QColor, QPainter
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QListWidget, QListWidgetItem,
     QLabel, QPushButton, QHBoxLayout, QVBoxLayout, QFileDialog, QMessageBox,
-    QFrame, QSplitter, QSizePolicy
+    QFrame, QSplitter, QSizePolicy, QLineEdit
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+import requests
+import tempfile
+
+FREE_DICT_API_BASE = os.environ.get(
+    "FREEDICT_API_BASE",
+    "https://api.dictionaryapi.dev/api/v2/entries/en",
+)
 
 
 DARK_THEME = """
@@ -168,6 +177,9 @@ class MainWindow(QMainWindow):
         self.left_current = [] # 左侧当前 basename
         self.right_current = []# 右侧当前 basename
         self.current_name = None
+        self.current_audio_path = None
+        self.temp_audio_files = []  # 在线音频临时文件列表
+        self.search_results = []
 
         # 音频播放器
         self.player = QMediaPlayer(self)
@@ -206,6 +218,7 @@ class MainWindow(QMainWindow):
         self.preview.setObjectName("preview")
         self.preview.setMinimumHeight(360)
         self.preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.preview.setWordWrap(True)
 
         # 文件名显示
         self.name_label = QLabel("")
@@ -233,6 +246,14 @@ class MainWindow(QMainWindow):
         self.btn_theme_dark.clicked.connect(lambda: self.apply_theme("dark"))
         theme_row.addWidget(self.btn_theme_light)
         theme_row.addWidget(self.btn_theme_dark)
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("在线搜词...")
+        self.search_input.setMinimumWidth(180)
+        self.search_input.returnPressed.connect(self.handle_search)
+        self.btn_search = QPushButton("搜索")
+        self.btn_search.clicked.connect(self.handle_search)
+        theme_row.addWidget(self.search_input)
+        theme_row.addWidget(self.btn_search)
         theme_row.addStretch(1)
 
         # 布局：左右 + 中间预览区
@@ -286,6 +307,193 @@ class MainWindow(QMainWindow):
         if hasattr(self, "btn_theme_dark"):
             self.btn_theme_dark.setEnabled(self.current_theme != "dark")
 
+    def cleanup_temp_audios(self):
+        for path in self.temp_audio_files:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        self.temp_audio_files = []
+
+    def handle_search(self):
+        if not hasattr(self, "search_input"):
+            return
+        word = self.search_input.text().strip()
+        if not word:
+            return
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            display_text, audio_path = self.fetch_word_data(word)
+        except ValueError:
+            self._show_not_found(word)
+            return
+        except Exception as exc:
+            QMessageBox.warning(self, "提示", f"搜索失败：{exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self.stop_audio()
+        self.preview.setPixmap(QPixmap())
+        self.preview.setText(display_text)
+        self.current_name = word
+        self.name_label.setText(word)
+        self.current_audio_path = audio_path
+        self.btn_move.setEnabled(False)
+        self.btn_play.setEnabled(bool(audio_path))
+        self._record_search_result(word, display_text, audio_path)
+        self.refresh_lists()
+
+    def fetch_word_data(self, word: str):
+        definition, dict_audio = self._query_dictionary(word)
+
+        if not definition:
+            raise ValueError("未找到对应的单词")
+
+        display_parts = [word, definition]
+        display_text = "\n".join([part for part in display_parts if part])
+
+        audio_path = None
+        if dict_audio:
+            audio_path = self._download_audio(dict_audio)
+        if not audio_path:
+            audio_path = self._download_audio(
+                f"https://dict.youdao.com/dictvoice?type=2&audio={word}"
+            )
+
+        return display_text, audio_path
+
+    def _query_dictionary(self, word: str):
+        base = FREE_DICT_API_BASE.rstrip('/')
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+        }
+
+        variants = {base}
+        lowered_base = base.lower()
+        if lowered_base.endswith('/en'):
+            root = base[:-3]
+            variants.add(f"{root}/en_US")
+            variants.add(f"{root}/en_GB")
+
+        words = []
+        for variant in [word, word.strip(), word.lower(), word.upper()]:
+            if variant and variant not in words:
+                words.append(variant)
+
+        session = requests.Session()
+        for lang_base in variants:
+            for w in words:
+                encoded_word = requests.utils.quote(w)
+                url = f"{lang_base}/{encoded_word}"
+                resp = None
+                for _ in range(3):
+                    try:
+                        resp = session.get(url, timeout=(5, 10), headers=headers)
+                        break
+                    except requests.RequestException:
+                        resp = None
+                        continue
+                if not resp or resp.status_code != 200:
+                    continue
+                try:
+                    data = resp.json()
+                except ValueError:
+                    continue
+                if not isinstance(data, list) or not data:
+                    continue
+                entry = data[0]
+                definitions = []
+                for meaning in entry.get("meanings", []):
+                    part = meaning.get("partOfSpeech", "")
+                    defs = meaning.get("definitions") or []
+                    for item in defs:
+                        candidate = item.get("definition")
+                        if not candidate:
+                            continue
+                        if part:
+                            definitions.append(f"{part}: {candidate}")
+                        else:
+                            definitions.append(candidate)
+                        if len(definitions) >= 3:
+                            break
+                    if len(definitions) >= 3:
+                        break
+                audio_url = None
+                for phonetic in entry.get("phonetics") or []:
+                    candidate = phonetic.get("audio")
+                    if candidate:
+                        audio_url = candidate
+                        break
+                if definitions or audio_url:
+                    definition_text = "\n".join(definitions)
+                    return definition_text, audio_url
+        return None, None
+
+    def _download_audio(self, url: Optional[str]):
+        if not url:
+            return None
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            resp = requests.get(url, timeout=5, headers=headers)
+            if not (resp.ok and resp.content):
+                return None
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+            tmp.write(resp.content)
+            tmp.close()
+            self.temp_audio_files.append(tmp.name)
+            return tmp.name
+        except Exception:
+            return None
+
+    def _record_search_result(self, word: str, text: str, audio: Optional[str]):
+        lowered = word.lower()
+        self.search_results = [entry for entry in self.search_results if entry["name"].lower() != lowered]
+        self.search_results.insert(0, {
+            "type": "search",
+            "name": word,
+            "text": text,
+            "audio": audio,
+        })
+
+    def _create_search_icon(self, text: str) -> QIcon:
+        pix = QPixmap(48, 48)
+        if self.current_theme == "light":
+            pix.fill(QColor("#dfe7ff"))
+            pen_color = QColor("#1d2550")
+        else:
+            pix.fill(QColor("#4a5b82"))
+            pen_color = QColor("#ffffff")
+        painter = QPainter(pix)
+        painter.setPen(pen_color)
+        painter.setFont(QFont("Arial", 16, QFont.Bold))
+        painter.drawText(pix.rect(), Qt.AlignCenter, text[:2].upper())
+        painter.end()
+        return QIcon(pix)
+
+    def show_search_result(self, entry: dict):
+        self.stop_audio()
+        self.preview.setPixmap(QPixmap())
+        self.preview.setText(entry.get("text", entry.get("name", "")))
+        self.current_name = entry.get("name", "")
+        self.name_label.setText(self.current_name)
+        self.current_audio_path = entry.get("audio")
+        self.btn_move.setEnabled(False)
+        self.btn_play.setEnabled(bool(self.current_audio_path))
+
+    def _show_not_found(self, word: str):
+        self.preview.setPixmap(QPixmap())
+        self.preview.setText(f"未找到单词：{word}")
+        self.current_name = word
+        self.name_label.setText(word)
+        self.current_audio_path = None
+        self.btn_move.setEnabled(False)
+        self.btn_play.setEnabled(False)
+
+
     # ---------- Data ----------
     def _load_data(self):
         if not self.data_dir.exists():
@@ -316,8 +524,12 @@ class MainWindow(QMainWindow):
         self.show_item(name, from_left=True)
 
     def on_right_click(self, item: QListWidgetItem):
-        name = item.data(Qt.UserRole)
-        self.show_item(name, from_left=False)
+        data = item.data(Qt.UserRole)
+        if isinstance(data, dict) and data.get("type") == "search":
+            self.show_search_result(data)
+        else:
+            name = data if isinstance(data, str) else str(data)
+            self.show_item(name, from_left=False)
 
     def show_item(self, name: str, from_left: bool):
         self.current_name = name
@@ -331,17 +543,22 @@ class MainWindow(QMainWindow):
                 self.preview.setPixmap(
                     pix.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 )
+                self.preview.setText("")
             else:
+                self.preview.setPixmap(QPixmap())
                 self.preview.setText("图片无法加载")
         else:
+            self.preview.setPixmap(QPixmap())
             self.preview.setText("未找到对应图片")
 
         # 播放同名音频
         aud_path = self.audios.get(name)
         if aud_path and aud_path.exists():
+            self.current_audio_path = str(aud_path)
             self.play_audio(aud_path)
             self.btn_play.setEnabled(True)
         else:
+            self.current_audio_path = None
             self.stop_audio()
             self.btn_play.setEnabled(False)
 
@@ -365,13 +582,14 @@ class MainWindow(QMainWindow):
         self.player.play()
 
     def play_current_audio(self):
-        if not self.current_name:
+        if not self.current_audio_path:
             return
-        aud_path = self.audios.get(self.current_name)
-        if aud_path and aud_path.exists():
-            self.play_audio(aud_path)
+        audio_path = Path(self.current_audio_path)
+        if audio_path.exists():
+            self.play_audio(audio_path)
             self.btn_play.setEnabled(True)
         else:
+            self.current_audio_path = None
             self.stop_audio()
             self.btn_play.setEnabled(False)
 
@@ -404,6 +622,7 @@ class MainWindow(QMainWindow):
             self.show_item(next_name, from_left=True)
         else:
             self.current_name = None
+            self.current_audio_path = None
             self.preview.setText("所有图片已完成")
             self.preview.setPixmap(QPixmap())
             self.name_label.setText("")
@@ -420,6 +639,9 @@ class MainWindow(QMainWindow):
         self.btn_move.setEnabled(False)
         self.btn_play.setEnabled(False)
         self.stop_audio()
+        self.current_audio_path = None
+        self.search_results = []
+        self.cleanup_temp_audios()
         self.refresh_lists()
 
     def refresh_lists(self):
@@ -447,11 +669,20 @@ class MainWindow(QMainWindow):
                 item.setIcon(ico)
             self.right_list.addItem(item)
 
+        for entry in self.search_results:
+            item = QListWidgetItem(entry["name"])
+            item.setData(Qt.UserRole, entry)
+            item.setIcon(self._create_search_icon(entry["name"]))
+            if entry.get("text"):
+                item.setToolTip(entry["text"])
+            self.right_list.addItem(item)
+
         self.update_counts()
 
     def update_counts(self):
         self.left_label.setText(f"待选 ({len(self.left_current)})")
-        self.right_label.setText(f"已选 ({len(self.right_current)})")
+        total_right = len(self.right_current) + len(self.search_results)
+        self.right_label.setText(f"已选 ({total_right})")
 
     def select_left_item(self, name: str):
         for row in range(self.left_list.count()):
