@@ -2,3 +2,7 @@ data/
 .idea/
 .venv/
 *.xml
+build
+dist
+*.exe
+*.spec

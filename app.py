@@ -140,9 +140,17 @@ def resource_path(rel: str) -> str:
     """
     PyInstaller 打包后资源路径兼容
     """
-    if hasattr(sys, "_MEIPASS"):
-        return os.path.join(sys._MEIPASS, rel)
-    return os.path.join(os.path.abspath("."), rel)
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        exe_candidate = exe_dir / rel
+        if exe_candidate.exists():
+            return str(exe_candidate)
+        if hasattr(sys, "_MEIPASS"):
+            bundle_candidate = Path(sys._MEIPASS) / rel
+            if bundle_candidate.exists():
+                return str(bundle_candidate)
+        return str(exe_candidate)
+    return str(Path(__file__).resolve().parent / rel)
 
 
 class MainWindow(QMainWindow):
